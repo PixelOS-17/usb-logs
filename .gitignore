@@ -1,0 +1,4 @@
+/out/
+/key/
+/hosttest/*
+!/hosttest/run.sh
