@@ -117,7 +117,7 @@ final class Shizuku {
         }
     }
 
-    static Access.Command start(String[] command) throws IOException {
+    static ShellCapture.Command start(String[] command) throws IOException {
         IBinder binder = require();
         if (!granted) {
             throw new IOException("Tap Allow Shizuku access first.");
@@ -180,7 +180,7 @@ final class Shizuku {
         }
     }
 
-    private static final class RemoteCommand implements Access.Command {
+    private static final class RemoteCommand implements ShellCapture.Command {
         private final IBinder process;
         private final OutputStream stdin;
         private final InputStream stdout;

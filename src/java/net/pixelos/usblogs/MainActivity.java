@@ -1,11 +1,17 @@
 package net.pixelos.usblogs;
 
+import android.Manifest;
 import android.app.Activity;
-import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.content.res.TypedArray;
+import android.database.Cursor;
 import android.graphics.Typeface;
+import android.net.Uri;
 import android.os.Bundle;
+import android.provider.OpenableColumns;
+import android.provider.Settings;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
@@ -18,21 +24,16 @@ import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
-import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.text.SimpleDateFormat;
-import java.util.Arrays;
-import java.util.Base64;
+import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.Date;
-import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -46,13 +47,7 @@ public final class MainActivity extends Activity {
             + "Logs can contain app names, network names and phone numbers. Only send them to"
             + " the developer who asked for them.";
 
-    // Root and the shell user get separate directories, so neither trips over files the
-    // other owns. The script is replaced by rename so a running capture keeps its own copy.
-    private static final String RUN_SCRIPT = "d=/data/local/tmp/pixelos-logs-$(id -u)"
-            + " && mkdir -p $d && cat > $d/capture.sh.new && mv $d/capture.sh.new $d/capture.sh"
-            + " && exec sh $d/capture.sh ";
-
-    private static final int KEEP_ARCHIVES = 5;
+    private static final String SHIZUKU_PACKAGE = "moe.shizuku.privileged.api";
 
     private static final class Scenario {
         final String id;
@@ -112,8 +107,9 @@ public final class MainActivity extends Activity {
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private SharedPreferences prefs;
     private volatile Access access;
-    /** The key=value lines of the last "capture.sh status", empty when unknown. */
-    private Map<String, String> capture = Collections.emptyMap();
+    private volatile Capture capture;
+    /** The last Capture.status(), empty when unknown. */
+    private Map<String, String> state = Collections.emptyMap();
     private int pending;
 
     private RadioGroup accessGroup;
@@ -122,7 +118,9 @@ public final class MainActivity extends Activity {
     private TextView steps;
     private EditText notes;
     private CheckBox bugreport;
+    private TextView waiting;
     private Button allow;
+    private Button takeBugreport;
     private Button start;
     private Button mark;
     private Button stop;
@@ -130,17 +128,13 @@ public final class MainActivity extends Activity {
     private Button again;
     private TextView status;
 
-    static File archiveDir(Context context) {
-        return new File(context.getCacheDir(), "logs");
-    }
-
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         int pad = (int) (16 * getResources().getDisplayMetrics().density);
         prefs = getSharedPreferences("settings", MODE_PRIVATE);
-        access = Access.valueOf(prefs.getString("access",
-                (hasSu() ? Access.ROOT : Access.SHIZUKU).name()));
+        access = Access.valueOf(prefs.getString("access", defaultAccess().name()));
+        capture = access.open(this);
 
         TextView intro = new TextView(this);
         intro.setText(INTRO);
@@ -149,25 +143,27 @@ public final class MainActivity extends Activity {
         accessGroup.setId(ACCESS_GROUP_ID);
         addRadio(accessGroup, FIRST_ACCESS_ID + Access.ROOT.ordinal(), "Root");
         addRadio(accessGroup, FIRST_ACCESS_ID + Access.SHIZUKU.ordinal(), "Shizuku, no root needed");
+        addRadio(accessGroup, FIRST_ACCESS_ID + Access.NONE.ordinal(),
+                "Neither: fewer logs, plus a system bug report");
         accessGroup.check(FIRST_ACCESS_ID + access.ordinal());
         accessGroup.setOnCheckedChangeListener((group, id) -> {
             access = Access.values()[id - FIRST_ACCESS_ID];
+            capture = access.open(this);
             prefs.edit().putString("access", access.name()).apply();
             bugreport.setChecked(access == Access.SHIZUKU);
             refresh();
         });
 
         accessState = new TextView(this);
-
-        allow = new Button(this);
-        allow.setText("Allow Shizuku access");
-        allow.setOnClickListener(v -> {
+        allow = secondaryButton("Allow Shizuku access", v -> {
             try {
                 Shizuku.requestPermission();
             } catch (IOException e) {
                 status.setText(reason(e));
             }
         });
+        takeBugreport = secondaryButton("Take a bug report", v -> openBugreport());
+        waiting = new TextView(this);
 
         scenarioGroup = new RadioGroup(this);
         scenarioGroup.setId(SCENARIO_GROUP_ID);
@@ -194,28 +190,36 @@ public final class MainActivity extends Activity {
                 + " get kernel logs and crash files with Shizuku.");
         bugreport.setChecked(access == Access.SHIZUKU);
 
-        start = button("Start capture", v -> perform("Starting",
-                () -> run("start " + selected().id)));
-        mark = button("Mark: the problem is happening now", v -> perform("Marking",
-                () -> run("mark")));
+        start = button("Start capture", v -> {
+            String scenario = selected().id;
+            if (access == Access.NONE) {
+                askForNotifications();
+            }
+            Capture current = capture;
+            perform("Starting", () -> current.start(scenario));
+        });
+        mark = secondaryButton("Mark: the problem is happening now", v -> {
+            Capture current = capture;
+            perform("Marking", current::mark);
+        });
         stop = button("Stop and share", v -> {
-            String scenario = capture.get("scenario");
-            String args = notesArg(scenario(scenario)) + bugreportArg();
-            perform(packingLabel("Stopping"), () -> {
-                String stopped = run("stop " + args);
-                return stopped + share(archive(scenario));
-            });
+            Scenario scenario = scenario(state.get("scenario"));
+            String text = notesText(scenario);
+            boolean report = includeBugreport();
+            Capture current = capture;
+            perform(packingLabel("Stopping"),
+                    () -> share(Archives.finish(this, current.stop(scenario.id, text, report))));
         });
         collect = button("Collect now and share", v -> {
             Scenario scenario = selected();
-            String args = scenario.id + " " + notesArg(scenario) + bugreportArg();
-            perform(packingLabel("Collecting"), () -> {
-                String collected = run("collect " + args);
-                return collected + share(archive(scenario.id));
-            });
+            String text = notesText(scenario);
+            boolean report = includeBugreport();
+            Capture current = capture;
+            perform(packingLabel("Collecting"),
+                    () -> share(Archives.finish(this, current.collect(scenario.id, text, report))));
         });
-        again = button("Share last logs", v -> {
-            File[] archives = archives();
+        again = secondaryButton("Share last logs", v -> {
+            File[] archives = Archives.list(this);
             if (archives.length > 0) {
                 startShare(archives[0]);
             }
@@ -239,6 +243,8 @@ public final class MainActivity extends Activity {
         content.addView(steps);
         content.addView(notes);
         content.addView(bugreport);
+        content.addView(takeBugreport);
+        content.addView(waiting);
         for (Button button : new Button[] {start, mark, stop, collect, again}) {
             content.addView(button);
         }
@@ -248,6 +254,16 @@ public final class MainActivity extends Activity {
         scroll.setFitsSystemWindows(true);
         scroll.addView(content);
         setContentView(scroll);
+
+        if (savedInstanceState == null) {
+            addSharedBugreport(getIntent());
+        }
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        addSharedBugreport(intent);
     }
 
     @Override
@@ -269,6 +285,13 @@ public final class MainActivity extends Activity {
         worker.shutdown();
     }
 
+    private Access defaultAccess() {
+        if (hasSu()) {
+            return Access.ROOT;
+        }
+        return installed(SHIZUKU_PACKAGE) ? Access.SHIZUKU : Access.NONE;
+    }
+
     private static boolean hasSu() {
         String path = System.getenv("PATH");
         if (path == null) {
@@ -280,6 +303,15 @@ public final class MainActivity extends Activity {
             }
         }
         return false;
+    }
+
+    private boolean installed(String packageName) {
+        try {
+            getPackageManager().getPackageInfo(packageName, 0);
+            return true;
+        } catch (PackageManager.NameNotFoundException e) {
+            return false;
+        }
     }
 
     private void addRadio(RadioGroup group, int id, String label) {
@@ -296,10 +328,21 @@ public final class MainActivity extends Activity {
         return button;
     }
 
+    private Button secondaryButton(String label, View.OnClickListener listener) {
+        Button button = new Button(this, null, android.R.attr.borderlessButtonStyle);
+        button.setText(label);
+        button.setOnClickListener(listener);
+        return button;
+    }
+
     private TextView heading(String text, int pad) {
+        TypedArray attributes = obtainStyledAttributes(new int[] {android.R.attr.colorAccent});
+        int accent = attributes.getColor(0, 0);
+        attributes.recycle();
         TextView heading = new TextView(this);
         heading.setText(text);
         heading.setTypeface(Typeface.DEFAULT_BOLD);
+        heading.setTextColor(accent);
         heading.setPadding(0, pad, 0, 0);
         return heading;
     }
@@ -319,24 +362,40 @@ public final class MainActivity extends Activity {
     }
 
     private boolean ready() {
-        return access == Access.ROOT || Shizuku.granted();
+        return access != Access.SHIZUKU || Shizuku.granted();
+    }
+
+    private boolean includeBugreport() {
+        return access != Access.NONE && bugreport.isChecked();
     }
 
     private String packingLabel(String verb) {
-        return verb + (bugreport.isChecked()
+        return verb + (includeBugreport()
                 ? " and taking a bug report, which takes 2 to 3 minutes"
                 : " and packing the logs");
     }
 
-    /** The tester's description for capture.sh, base64 encoded so it is safe in a command. */
-    private String notesArg(Scenario scenario) {
-        String text = "Problem: " + scenario.title + "\nRun with: " + access + "\n\n"
-                + notes.getText();
-        return Base64.getEncoder().encodeToString(text.getBytes(StandardCharsets.UTF_8));
+    private String notesText(Scenario scenario) {
+        return "Problem: " + scenario.title + "\nRun with: " + access + "\n\n" + notes.getText();
     }
 
-    private String bugreportArg() {
-        return bugreport.isChecked() ? " bugreport" : "";
+    private void askForNotifications() {
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[] {Manifest.permission.POST_NOTIFICATIONS}, 0);
+        }
+    }
+
+    private void openBugreport() {
+        if (Settings.Global.getInt(getContentResolver(),
+                Settings.Global.DEVELOPMENT_SETTINGS_ENABLED, 0) == 0) {
+            status.setText("Turn on Developer options first: open Settings > About phone and tap"
+                    + " Build number seven times. Then tap Take a bug report again.");
+            return;
+        }
+        status.setText("In Developer options, tap Bug report, then Full report. When the"
+                + " notification says it is ready, tap it and pick PixelOS Logs.");
+        startActivity(new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS));
     }
 
     private void refresh() {
@@ -344,32 +403,38 @@ public final class MainActivity extends Activity {
         if (ready()) {
             perform("Checking for a running capture", () -> "");
         } else {
-            capture = Collections.emptyMap();
+            state = Collections.emptyMap();
             updateControls();
         }
     }
 
     private String describeAccess() {
-        if (access == Access.ROOT) {
-            return "Allow root access when your root manager asks.";
+        switch (access) {
+            case ROOT:
+                return "Allow root access when your root manager asks.";
+            case SHIZUKU:
+                if (!installed(SHIZUKU_PACKAGE)) {
+                    return "Install Shizuku, start it with wireless debugging, then come back.";
+                }
+                if (!Shizuku.running()) {
+                    return "Start Shizuku in its app, then come back here.";
+                }
+                if (!Shizuku.granted()) {
+                    return "Shizuku is running. Tap Allow Shizuku access.";
+                }
+                return "Shizuku is ready. Kernel logs and crash files come from the bug report.";
+            default:
+                return "Records the USB, charging, network, sound, camera and screen changes that"
+                        + " any app can see. For full logs, add a system bug report.";
         }
-        if (!Shizuku.running()) {
-            return "Shizuku is not running. Install the Shizuku app, start it with wireless"
-                    + " debugging, then come back here.";
-        }
-        if (!Shizuku.granted()) {
-            return "Shizuku is running. Tap Allow Shizuku access.";
-        }
-        return "Shizuku is ready. Without root the kernel log comes from the bug report.";
     }
 
     private void updateControls() {
         boolean busy = pending > 0;
-        String state = capture.get("state");
-        boolean idle = "idle".equals(state);
-        boolean running = "running".equals(state);
-        boolean active = running || "interrupted".equals(state);
-        boolean chosen = selected() != null;
+        String value = state.get("state");
+        boolean idle = "idle".equals(value);
+        boolean running = "running".equals(value);
+        boolean active = running || "interrupted".equals(value);
         boolean ready = ready();
 
         for (RadioGroup group : new RadioGroup[] {accessGroup, scenarioGroup}) {
@@ -377,19 +442,42 @@ public final class MainActivity extends Activity {
                 group.getChildAt(i).setEnabled(!busy && !active);
             }
         }
-        allow.setVisibility(access == Access.SHIZUKU && Shizuku.running() && !Shizuku.granted()
-                ? View.VISIBLE : View.GONE);
-        start.setEnabled(!busy && ready && idle && chosen);
-        collect.setEnabled(!busy && ready && idle && chosen);
-        mark.setEnabled(!busy && ready && running);
-        stop.setEnabled(!busy && ready && active);
-        again.setEnabled(!busy && archives().length > 0);
+        show(allow, access == Access.SHIZUKU && Shizuku.running() && !Shizuku.granted());
+        show(bugreport, access != Access.NONE);
+        show(takeBugreport, access == Access.NONE);
+        File[] reports = Archives.pending(this);
+        show(waiting, reports.length > 0);
+        if (reports.length > 0) {
+            long bytes = 0;
+            for (File report : reports) {
+                bytes += report.length();
+            }
+            waiting.setText(String.format(Locale.US, "Bug report ready to add (%d file%s, %.1f MB)."
+                    + " It goes into the next archive you share.", reports.length,
+                    reports.length == 1 ? "" : "s", bytes / 1048576.0));
+        }
+        show(start, ready && !active);
+        show(collect, ready && !active);
+        show(mark, ready && running);
+        show(stop, ready && active);
+        show(again, Archives.list(this).length > 0);
+        boolean chosen = selected() != null;
+        start.setEnabled(!busy && idle && chosen);
+        collect.setEnabled(!busy && idle && chosen);
+        for (Button button : new Button[] {allow, takeBugreport, mark, stop, again}) {
+            button.setEnabled(!busy);
+        }
+    }
+
+    private static void show(View view, boolean visible) {
+        view.setVisibility(visible ? View.VISIBLE : View.GONE);
     }
 
     private void perform(String label, Step step) {
         pending++;
         updateControls();
         status.setText(label + "...");
+        Capture current = capture;
         worker.execute(() -> {
             String message;
             try {
@@ -400,9 +488,9 @@ public final class MainActivity extends Activity {
                 Thread.currentThread().interrupt();
                 message = "Interrupted.";
             }
-            Map<String, String> state = Collections.emptyMap();
+            Map<String, String> result = Collections.emptyMap();
             try {
-                state = parse(run("status"));
+                result = current.status();
             } catch (IOException e) {
                 if (!reason(e).equals(message)) {
                     message = message + "\n" + reason(e);
@@ -410,11 +498,11 @@ public final class MainActivity extends Activity {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
-            String text = (message.trim() + "\n\n" + describe(state)).trim();
-            Map<String, String> result = state;
+            String text = (message.trim() + "\n\n" + describe(result)).trim();
+            Map<String, String> next = result;
             runOnUiThread(() -> {
                 pending--;
-                capture = result;
+                state = next;
                 updateControls();
                 status.setText(text);
             });
@@ -423,17 +511,6 @@ public final class MainActivity extends Activity {
 
     private static String reason(IOException e) {
         return e.getMessage() != null ? e.getMessage() : e.toString();
-    }
-
-    private static Map<String, String> parse(String output) {
-        Map<String, String> values = new HashMap<>();
-        for (String line : output.split("\n")) {
-            int eq = line.indexOf('=');
-            if (eq > 0) {
-                values.put(line.substring(0, eq), line.substring(eq + 1));
-            }
-        }
-        return values;
     }
 
     private static String describe(Map<String, String> state) {
@@ -455,66 +532,56 @@ public final class MainActivity extends Activity {
                 since, Long.parseLong(state.get("size_kb")) / 1024.0, state.get("marks"));
     }
 
-    /** Runs capture.sh and returns its output, which includes its error messages. */
-    private String run(String args) throws IOException, InterruptedException {
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        try {
-            exec(args + " 2>&1", out);
-        } catch (IOException e) {
-            String output = out.toString(StandardCharsets.UTF_8).trim();
-            throw output.isEmpty() ? e : new IOException(output, e);
+    /** Keeps bug reports shared from the system's bug report notification for the next archive. */
+    private void addSharedBugreport(Intent intent) {
+        List<Uri> uris = streams(intent);
+        if (uris.isEmpty()) {
+            return;
         }
-        return out.toString(StandardCharsets.UTF_8);
+        perform("Adding the bug report", () -> {
+            File dir = Archives.pendingDir(this);
+            if (!dir.isDirectory() && !dir.mkdirs()) {
+                throw new IOException("Cannot create " + dir);
+            }
+            for (Uri uri : uris) {
+                try (InputStream in = getContentResolver().openInputStream(uri)) {
+                    if (in == null) {
+                        throw new IOException("Cannot read " + uri);
+                    }
+                    Files.copy(in, new File(dir, fileName(uri)).toPath(),
+                            StandardCopyOption.REPLACE_EXISTING);
+                }
+            }
+            return "Bug report added. Pick what went wrong, describe it, then tap Collect now and"
+                    + " share, or Stop and share if a capture is running.";
+        });
     }
 
-    /** Runs capture.sh with its stdout copied to sink. */
-    private void exec(String args, OutputStream sink) throws IOException, InterruptedException {
-        Access.Command command = access.start(RUN_SCRIPT + args);
-        try (OutputStream stdin = command.stdin(); InputStream script = getAssets().open("capture.sh")) {
-            script.transferTo(stdin);
+    @SuppressWarnings("deprecation")
+    private static List<Uri> streams(Intent intent) {
+        if (Intent.ACTION_SEND_MULTIPLE.equals(intent.getAction())) {
+            ArrayList<Uri> uris = intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM);
+            return uris != null ? uris : Collections.emptyList();
         }
-        try (InputStream stdout = command.stdout()) {
-            stdout.transferTo(sink);
+        if (Intent.ACTION_SEND.equals(intent.getAction())) {
+            Uri uri = intent.getParcelableExtra(Intent.EXTRA_STREAM);
+            return uri != null ? Collections.singletonList(uri) : Collections.emptyList();
         }
-        String errors;
-        try (InputStream stderr = command.stderr()) {
-            errors = new String(stderr.readAllBytes(), StandardCharsets.UTF_8).trim();
-        }
-        int exit = command.waitFor();
-        if (exit != 0) {
-            throw new IOException(errors.isEmpty() ? "capture.sh " + args + " failed (" + exit + ")"
-                    : errors);
-        }
+        return Collections.emptyList();
     }
 
-    private File archive(String scenario) throws IOException, InterruptedException {
-        File dir = archiveDir(this);
-        if (!dir.isDirectory() && !dir.mkdirs()) {
-            throw new IOException("Cannot create " + dir);
+    /** The shared file's own name, reduced to a plain file name inside the pending directory. */
+    private String fileName(Uri uri) {
+        String name = uri.getLastPathSegment();
+        try (Cursor cursor = getContentResolver().query(uri,
+                new String[] {OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst() && !cursor.isNull(0)) {
+                name = cursor.getString(0);
+            }
         }
-        String stamp = new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date());
-        File archive = new File(dir, "pixelos-logs-" + scenario + "-" + stamp + ".tar.gz");
-        try (OutputStream out = new FileOutputStream(archive)) {
-            exec("archive", out);
-        } catch (IOException | InterruptedException e) {
-            Files.deleteIfExists(archive.toPath());
-            throw e;
-        }
-        File[] archives = archives();
-        for (int i = KEEP_ARCHIVES; i < archives.length; i++) {
-            Files.delete(archives[i].toPath());
-        }
-        return archive;
-    }
-
-    /** Saved archives, newest first. */
-    private File[] archives() {
-        File[] archives = archiveDir(this).listFiles((dir, name) -> name.endsWith(".tar.gz"));
-        if (archives == null) {
-            return new File[0];
-        }
-        Arrays.sort(archives, Comparator.comparingLong(File::lastModified).reversed());
-        return archives;
+        name = name == null ? "" : new File(name).getName();
+        return name.isEmpty() || name.equals(".") || name.equals("..")
+                ? "bugreport-" + System.currentTimeMillis() + ".zip" : name;
     }
 
     private String share(File archive) {
@@ -527,7 +594,7 @@ public final class MainActivity extends Activity {
 
     private void startShare(File archive) {
         Intent send = new Intent(Intent.ACTION_SEND)
-                .setType("application/gzip")
+                .setType(Archives.type(archive))
                 .putExtra(Intent.EXTRA_STREAM, LogProvider.uriFor(archive))
                 .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
         startActivity(Intent.createChooser(send, "Send logs"));

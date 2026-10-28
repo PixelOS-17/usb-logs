@@ -20,7 +20,7 @@ public final class LogProvider extends ContentProvider {
     }
 
     private File archiveFor(Uri uri) {
-        return new File(MainActivity.archiveDir(getContext()), uri.getLastPathSegment());
+        return new File(Archives.dir(getContext()), uri.getLastPathSegment());
     }
 
     @Override
@@ -45,7 +45,7 @@ public final class LogProvider extends ContentProvider {
 
     @Override
     public String getType(Uri uri) {
-        return "application/gzip";
+        return Archives.type(archiveFor(uri));
     }
 
     @Override
