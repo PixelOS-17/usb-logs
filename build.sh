@@ -1,11 +1,13 @@
 #!/bin/bash
-# Builds USB Logs with the AOSP prebuilts only. Usage: build.sh [pixelos-root]
+# Builds PixelOS Logs with the AOSP prebuilts only. Usage: build.sh [pixelos-root]
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 top=${1:-$here/../../pixelos}
 api=36
 min_api=33
+version_code=2
+version_name=2.0
 
 jdk=$top/prebuilts/jdk/jdk21/linux-x86/bin
 tools=$top/prebuilts/sdk/tools/linux
@@ -34,7 +36,7 @@ fi
 "$tools/bin/aapt2" link -o "$out/unaligned.apk" -I "$android_jar" \
 	--manifest "$src/AndroidManifest.xml" -A "$src/assets" \
 	--min-sdk-version "$min_api" --target-sdk-version "$api" \
-	--version-code 1 --version-name 1.0
+	--version-code "$version_code" --version-name "$version_name"
 
 python3 -I -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1], "a", zipfile.ZIP_DEFLATED).write(sys.argv[2], "classes.dex")' \
 	"$out/unaligned.apk" "$out/dex/classes.dex"
@@ -42,6 +44,6 @@ python3 -I -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1], "a", zipfile.ZI
 "$tools/bin/zipalign" -p -f 4 "$out/unaligned.apk" "$out/aligned.apk"
 
 "$jdk/java" -jar "$tools/lib/apksigner.jar" sign --ks "$key" --ks-pass pass:usblogs \
-	--out "$out/usb-logs.apk" "$out/aligned.apk"
+	--out "$out/pixelos-logs.apk" "$out/aligned.apk"
 
-"$jdk/java" -jar "$tools/lib/apksigner.jar" verify --print-certs "$out/usb-logs.apk"
+"$jdk/java" -jar "$tools/lib/apksigner.jar" verify --print-certs "$out/pixelos-logs.apk"

@@ -2,9 +2,16 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="net.pixelos.usblogs">
 
+    <!-- Shizuku only sends its binder to apps that request this permission. -->
+    <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
+
     <application
-        android:label="USB Logs"
+        android:label="PixelOS Logs"
         android:theme="@android:style/Theme.DeviceDefault.DayNight">
+
+        <meta-data
+            android:name="moe.shizuku.client.V3_SUPPORT"
+            android:value="true" />
 
         <activity
             android:name=".MainActivity"
@@ -20,5 +27,12 @@
             android:authorities="net.pixelos.usblogs.logs"
             android:exported="false"
             android:grantUriPermissions="true" />
+
+        <provider
+            android:name=".ShizukuProvider"
+            android:authorities="net.pixelos.usblogs.shizuku"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
     </application>
 </manifest>
