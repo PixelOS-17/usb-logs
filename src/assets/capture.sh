@@ -40,14 +40,25 @@ usb_state() {
 
 battery_state() {
 	show_files /sys/class/power_supply/battery/capacity /sys/class/power_supply/battery/status \
-		/sys/class/power_supply/battery/current_now /sys/class/power_supply/battery/voltage_now \
-		/sys/class/power_supply/battery/temp /sys/class/power_supply/usb/online \
-		/sys/class/power_supply/usb/real_type
+		/sys/class/power_supply/battery/health /sys/class/power_supply/battery/current_now \
+		/sys/class/power_supply/battery/voltage_now /sys/class/power_supply/battery/temp \
+		/sys/class/power_supply/usb/online /sys/class/power_supply/usb/real_type \
+		/sys/class/power_supply/usb/current_now /sys/class/power_supply/usb/voltage_now
 	for z in /sys/class/thermal/thermal_zone*; do
 		[ -e "$z/temp" ] || continue
 		read -r type 2>/dev/null < "$z/type" || type=${z##*/}
 		read -r temp 2>/dev/null < "$z/temp" || temp="<read failed>"
 		echo "thermal $type=$temp"
+	done
+}
+
+cooling_state() {
+	for c in /sys/class/thermal/cooling_device*; do
+		[ -e "$c/cur_state" ] || continue
+		read -r type 2>/dev/null < "$c/type" || type=${c##*/}
+		read -r cur 2>/dev/null < "$c/cur_state" || cur="<read failed>"
+		read -r max 2>/dev/null < "$c/max_state" || max="?"
+		echo "cooling $type=$cur/$max"
 	done
 }
 
@@ -87,9 +98,32 @@ dump() {
 	done
 }
 
+collect_crashes() {
+	mkdir -p "$dir/tombstones"
+	cp /data/tombstones/tombstone_?? "$dir/tombstones/" 2>> "$dir/errors.txt"
+	cp -r /data/anr "$dir/anr" 2>> "$dir/errors.txt"
+	dumpsys dropbox --print > "$dir/dropbox.txt" 2>&1
+}
+
+collect_pstore() {
+	pstore=/sys/fs/pstore
+	if ! cp -r "$pstore" "$dir/pstore" 2>> "$dir/errors.txt"; then
+		# The shell user has search (not read) on pstorefs dirs, so copy known files directly.
+		mkdir -p "$dir/pstore"
+		for f in console-ramoops console-ramoops-0 pmsg-ramoops-0 dmesg-ramoops-0 dmesg-ramoops-1; do
+			[ -r "$pstore/$f" ] && cp "$pstore/$f" "$dir/pstore/" 2>> "$dir/errors.txt"
+		done
+	fi
+}
+
 # State worth comparing before and after the problem: written at start, at stop and by collect.
 scenario_state() {
 	case $scenario in
+	reboot)
+		section battery_state
+		section cooling_state
+		dump battery power thermalservice
+		;;
 	usb)
 		section ls -lZ /dev/usb_accessory /config/usb_gadget/g1/functions
 		section usb_state
@@ -108,10 +142,12 @@ scenario_state() {
 	network)
 		section ip addr
 		section ip route
-		dump wifi connectivity telephony.registry isub carrier_config
+		filtered 'radio|ims' lshal
+		dump wifi connectivity telephony.registry phone telecom ims isub carrier_config
 		;;
 	battery)
 		section battery_state
+		section cooling_state
 		dump battery power thermalservice
 		;;
 	display)
@@ -123,11 +159,8 @@ scenario_state() {
 # Files that only exist once the problem has happened: written at stop and by collect.
 scenario_files() {
 	case $scenario in
-	crash)
-		mkdir -p "$dir/tombstones"
-		cp /data/tombstones/tombstone_?? "$dir/tombstones/" 2>> "$dir/errors.txt"
-		cp -r /data/anr "$dir/anr" 2>> "$dir/errors.txt"
-		dumpsys dropbox --print > "$dir/dropbox.txt" 2>&1
+	reboot|crash|camera)
+		collect_crashes
 		;;
 	audio)
 		cp -r /data/misc/bluetooth/logs "$dir/bluetooth-logs" 2>> "$dir/errors.txt"
@@ -144,7 +177,7 @@ scenario_poll() {
 		poll usb_state 0.25 > "$dir/usb-state.txt" 2>&1 &
 		echo $! >> "$dir/pids"
 		;;
-	battery)
+	reboot|battery)
 		poll battery_state 10 > "$dir/battery.txt" 2>&1 &
 		echo $! >> "$dir/pids"
 		;;
@@ -181,7 +214,7 @@ add_bugreport() {
 
 finish() {
 	# pstore keeps the previous boot's kernel console and logcat across a crash or reboot.
-	cp -r /sys/fs/pstore "$dir/pstore" 2>> "$dir/errors.txt"
+	collect_pstore
 	logcat -L -b all -d -v threadtime > "$dir/logcat-last-boot.txt" 2>&1
 	scenario_files
 	printf '%s' "$notes" | base64 -d > "$dir/notes.txt" 2>> "$dir/errors.txt"

@@ -30,6 +30,10 @@ import android.os.PowerManager;
 import android.os.StatFs;
 import android.os.SystemClock;
 import android.provider.Settings;
+import android.telephony.CellSignalStrength;
+import android.telephony.ServiceState;
+import android.telephony.SignalStrength;
+import android.telephony.TelephonyDisplayInfo;
 import android.telephony.TelephonyManager;
 import android.view.Display;
 
@@ -148,6 +152,45 @@ final class DeviceState {
         return display.getDisplayId() + " " + display.getName() + " state=" + display.getState()
                 + " mode=" + mode.getPhysicalWidth() + "x" + mode.getPhysicalHeight()
                 + "@" + mode.getRefreshRate() + " refresh=" + display.getRefreshRate();
+    }
+
+    static String serviceState(ServiceState state) {
+        String name;
+        switch (state.getState()) {
+            case ServiceState.STATE_IN_SERVICE:
+                name = "IN_SERVICE";
+                break;
+            case ServiceState.STATE_OUT_OF_SERVICE:
+                name = "OUT_OF_SERVICE";
+                break;
+            case ServiceState.STATE_EMERGENCY_ONLY:
+                name = "EMERGENCY_ONLY";
+                break;
+            case ServiceState.STATE_POWER_OFF:
+                name = "POWER_OFF";
+                break;
+            default:
+                name = String.valueOf(state.getState());
+                break;
+        }
+        return "service=" + name + " roaming=" + state.getRoaming()
+                + " searching=" + state.isSearching();
+    }
+
+    static String signalStrength(SignalStrength signal) {
+        StringBuilder out = new StringBuilder("signal level=").append(signal.getLevel());
+        for (CellSignalStrength cell : signal.getCellSignalStrengths()) {
+            String type = cell.getClass().getSimpleName().replace("CellSignalStrength", "");
+            out.append(' ').append(type).append("(dbm=").append(cell.getDbm())
+                    .append(",lvl=").append(cell.getLevel()).append(')');
+        }
+        return out.toString();
+    }
+
+    static String telephonyDisplay(TelephonyDisplayInfo info) {
+        return "display network=" + info.getNetworkType()
+                + " override=" + info.getOverrideNetworkType()
+                + " roaming=" + info.isRoaming();
     }
 
     // A snapshot keeps going when one API is restricted or missing on a build; the failure is
@@ -305,13 +348,19 @@ final class DeviceState {
 
     private static void telephony(Context context, StringBuilder out) {
         TelephonyManager telephony = context.getSystemService(TelephonyManager.class);
-        line(out, "modems", telephony.getActiveModemCount());
+        int modems = telephony.getActiveModemCount();
+        line(out, "modems", modems);
         line(out, "phone_type", telephony.getPhoneType());
         line(out, "sim_state", telephony.getSimState());
+        for (int i = 0; i < modems; i++) {
+            line(out, "sim_state_" + i, telephony.getSimState(i));
+        }
         line(out, "sim_operator", telephony.getSimOperatorName());
         line(out, "network_operator", telephony.getNetworkOperatorName());
         line(out, "network_country", telephony.getNetworkCountryIso());
         line(out, "data_enabled", telephony.isDataEnabled());
+        SignalStrength signal = telephony.getSignalStrength();
+        line(out, "signal_strength", signal == null ? null : signalStrength(signal));
     }
 
     private static void biometrics(Context context, StringBuilder out) {

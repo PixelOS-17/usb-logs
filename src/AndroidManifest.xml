@@ -5,6 +5,9 @@
     <!-- Shizuku only sends its binder to apps that request this permission. -->
     <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
 
+    <!-- Optional: when granted via ADB (pm grant), lets AppCapture run logcat -b all directly. -->
+    <uses-permission android:name="android.permission.READ_LOGS" />
+
     <!-- Capturing without root or Shizuku. -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />

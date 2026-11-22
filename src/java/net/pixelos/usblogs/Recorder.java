@@ -10,6 +10,7 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.graphics.drawable.Icon;
 import android.hardware.camera2.CameraManager;
@@ -27,6 +28,11 @@ import android.os.IBinder;
 import android.os.PowerManager;
 import android.os.SystemClock;
 import android.provider.Settings;
+import android.telephony.ServiceState;
+import android.telephony.SignalStrength;
+import android.telephony.TelephonyCallback;
+import android.telephony.TelephonyDisplayInfo;
+import android.telephony.TelephonyManager;
 import android.util.Log;
 import android.view.Display;
 
@@ -42,6 +48,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Writes what changes on the phone to the running AppCapture session's events.txt: USB,
@@ -50,8 +57,11 @@ import java.util.concurrent.Executor;
 public final class Recorder extends Service {
     private static final String TAG = "PixelOSLogs";
     private static final String ACTION_MARK = "net.pixelos.usblogs.action.MARK";
+    private static final String EXTRA_FOREGROUND = "foreground";
     private static final String CHANNEL = "capture";
     private static final int NOTIFICATION = 1;
+
+    private static Process logcat;
 
     private HandlerThread thread;
     private Handler handler;
@@ -61,11 +71,55 @@ public final class Recorder extends Service {
     private final Map<String, String> last = new HashMap<>();
 
     static void start(Context context) {
-        context.startForegroundService(new Intent(context, Recorder.class));
+        start(context, false);
+    }
+
+    static void start(Context context, boolean foreground) {
+        Intent intent = new Intent(context, Recorder.class)
+                .putExtra(EXTRA_FOREGROUND, foreground);
+        context.startForegroundService(intent);
     }
 
     static void stop(Context context) {
         context.stopService(new Intent(context, Recorder.class));
+    }
+
+    /** Starts streaming logcat into the session when READ_LOGS is granted and UI is foreground. */
+    private static synchronized void startLogcat(File session) {
+        if (logcat != null && logcat.isAlive()) {
+            return;
+        }
+        File out = new File(session, "logcat.txt");
+        File err = new File(session, "errors.txt");
+        try {
+            logcat = new ProcessBuilder("/system/bin/logcat", "-b", "all", "-v", "threadtime",
+                    "-f", out.getPath(), "-r", "16384", "-n", "15")
+                    .redirectErrorStream(true)
+                    .redirectOutput(ProcessBuilder.Redirect.appendTo(err))
+                    .start();
+        } catch (IOException e) {
+            Log.e(TAG, "Cannot start logcat", e);
+        }
+    }
+
+    /** Stops any running live logcat process synchronously. Returns true if one was alive. */
+    static synchronized boolean stopLogcat() {
+        Process process = logcat;
+        logcat = null;
+        if (process == null) {
+            return false;
+        }
+        boolean alive = process.isAlive();
+        process.destroy();
+        try {
+            if (!process.waitFor(2, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            process.destroyForcibly();
+        }
+        return alive;
     }
 
     /** Opens and closes the file per line, so a crash or reboot loses nothing written. */
@@ -121,11 +175,16 @@ public final class Recorder extends Service {
             events = new File(session, "events.txt");
             register();
         }
+        if (intent != null && intent.getBooleanExtra(EXTRA_FOREGROUND, false)
+                && AppCapture.hasReadLogs(this)) {
+            startLogcat(session);
+        }
         return START_STICKY;
     }
 
     @Override
     public void onDestroy() {
+        stopLogcat();
         for (Runnable undo : cleanup) {
             undo.run();
         }
@@ -309,6 +368,39 @@ public final class Recorder extends Service {
         cleanup.add(() -> displays.unregisterDisplayListener(display));
         for (Display d : displays.getDisplays()) {
             display.onDisplayChanged(d.getDisplayId());
+        }
+
+        if (getPackageManager().hasSystemFeature(PackageManager.FEATURE_TELEPHONY)) {
+            TelephonyManager telephony = getSystemService(TelephonyManager.class);
+            if (telephony != null) {
+                TelephonyListener listener = new TelephonyListener();
+                try {
+                    telephony.registerTelephonyCallback(executor, listener);
+                    cleanup.add(() -> telephony.unregisterTelephonyCallback(listener));
+                } catch (SecurityException | UnsupportedOperationException e) {
+                    record("TELEPHONY callback unavailable: " + e.getMessage());
+                }
+            }
+        }
+    }
+
+    private final class TelephonyListener extends TelephonyCallback implements
+            TelephonyCallback.ServiceStateListener,
+            TelephonyCallback.SignalStrengthsListener,
+            TelephonyCallback.DisplayInfoListener {
+        @Override
+        public void onServiceStateChanged(ServiceState state) {
+            changed("tel_service", "TELEPHONY " + DeviceState.serviceState(state));
+        }
+
+        @Override
+        public void onSignalStrengthsChanged(SignalStrength signal) {
+            changed("tel_signal", "TELEPHONY " + DeviceState.signalStrength(signal));
+        }
+
+        @Override
+        public void onDisplayInfoChanged(TelephonyDisplayInfo info) {
+            changed("tel_display", "TELEPHONY " + DeviceState.telephonyDisplay(info));
         }
     }
 }

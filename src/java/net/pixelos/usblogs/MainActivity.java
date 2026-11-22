@@ -422,10 +422,17 @@ public final class MainActivity extends Activity {
                 if (!Shizuku.granted()) {
                     return "Shizuku is running. Tap Allow Shizuku access.";
                 }
-                return "Shizuku is ready. Kernel logs and crash files come from the bug report.";
+                return "Shizuku is ready. Keep the bug report box ticked for kernel dmesg and"
+                        + " crash files.";
             default:
-                return "Records the USB, charging, network, sound, camera and screen changes that"
-                        + " any app can see. For full logs, add a system bug report.";
+                if (AppCapture.hasReadLogs(this)) {
+                    return "READ_LOGS is granted: captures full logcat (main, system, radio,"
+                            + " crash, kernel) and device state. For dmesg, pstore or tombstones,"
+                            + " add a system bug report.";
+                }
+                return "Records USB, charging, thermal, network, telephony, sound, camera and"
+                        + " screen changes. For full logcat, grant READ_LOGS over ADB or add a"
+                        + " system bug report.";
         }
     }
 

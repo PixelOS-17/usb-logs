@@ -6,8 +6,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 top=${1:-$here/../../pixelos}
 api=36
 min_api=34
-version_code=3
-version_name=2.1
+version_code=4
+version_name=2.2
 
 jdk=$top/prebuilts/jdk/jdk21/linux-x86/bin
 tools=$top/prebuilts/sdk/tools/linux

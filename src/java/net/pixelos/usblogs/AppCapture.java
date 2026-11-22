@@ -1,6 +1,8 @@
 package net.pixelos.usblogs;
 
+import android.Manifest;
 import android.content.Context;
+import android.content.pm.PackageManager;
 
 import java.io.File;
 import java.io.IOException;
@@ -12,6 +14,7 @@ import java.util.Date;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
 /**
@@ -25,6 +28,11 @@ final class AppCapture implements Capture {
 
     AppCapture(Context context) {
         this.context = context.getApplicationContext();
+    }
+
+    static boolean hasReadLogs(Context context) {
+        return context.checkSelfPermission(Manifest.permission.READ_LOGS)
+                == PackageManager.PERMISSION_GRANTED;
     }
 
     static File sessions(Context context) {
@@ -81,7 +89,7 @@ final class AppCapture implements Capture {
         File session = newSession(scenario);
         write(new File(session, "start.txt"), DeviceState.snapshot(context));
         write(pointer(context), session.getName());
-        Recorder.start(context);
+        Recorder.start(context, true);
         return "Capturing to " + session.getName();
     }
 
@@ -97,7 +105,18 @@ final class AppCapture implements Capture {
             throw new IOException("No capture is running.");
         }
         Files.delete(pointer(context).toPath());
+        boolean hadLiveLogcat = Recorder.stopLogcat();
         Recorder.stop(context);
+        if (hasReadLogs(context)) {
+            File logcat = new File(session, "logcat.txt");
+            if (!hadLiveLogcat) {
+                // Keep any pre-reboot live logcat intact and dump the current boot separately.
+                dumpLogcat(logcat.isFile() && logcat.length() > 0
+                        ? new File(session, "logcat-end.txt") : logcat);
+            } else if (!logcat.isFile() || logcat.length() == 0) {
+                dumpLogcat(logcat);
+            }
+        }
         write(new File(session, "end.txt"), DeviceState.snapshot(context));
         write(new File(session, "notes.txt"), notes);
         return pack(session, scenario);
@@ -110,8 +129,29 @@ final class AppCapture implements Capture {
         }
         File session = newSession(scenario);
         write(new File(session, "now.txt"), DeviceState.snapshot(context));
+        if (hasReadLogs(context)) {
+            dumpLogcat(new File(session, "logcat.txt"));
+        }
         write(new File(session, "notes.txt"), notes);
         return pack(session, scenario);
+    }
+
+    private static void dumpLogcat(File out) throws IOException {
+        File err = new File(out.getParentFile(), "errors.txt");
+        Process process = new ProcessBuilder("/system/bin/logcat", "-b", "all", "-d", "-v",
+                "threadtime")
+                .redirectOutput(out)
+                .redirectError(ProcessBuilder.Redirect.appendTo(err))
+                .start();
+        try {
+            if (!process.waitFor(60, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                Recorder.append(err, "logcat dump timed out");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            process.destroyForcibly();
+        }
     }
 
     private File newSession(String scenario) throws IOException {
